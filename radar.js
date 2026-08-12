@@ -1,0 +1,287 @@
+/* 場地雷達 - 書籤版
+ *
+ * 這段程式跑在 teamweb.sporetrofit.com 這一頁裡面，用你自己的登入去查。
+ * 沒有伺服器、沒有共用帳號、沒有排程，每次點都是當下最新的。
+ *
+ * 它只讀不寫：只呼叫查詢用的 API，不會預約、不會付款、不會取消任何東西。
+ */
+(async function () {
+  'use strict';
+
+  if (document.getElementById('cr-root')) {
+    document.getElementById('cr-root').remove();
+  }
+  if (!location.host.includes('sporetrofit')) {
+    alert('請先在運動中心的網站上登入，再點這個書籤。');
+    return;
+  }
+
+  const VENUES = [
+    { lid: 'TMEGS', name: '鼓山運動中心', short: '鼓山' },
+    { lid: 'TMENZ', name: '楠仔坑運動中心', short: '楠仔坑' },
+  ];
+  const SPORTS = [
+    { name: '羽球', cat: 'Badminton', accent: '#E6FA4B' },
+    { name: '匹克球', cat: 'Pickleball', accent: '#46D0E8' },
+  ];
+  const DAYS = 8;
+  const SLOTS = Array.from({ length: 16 }, (_, i) =>
+    String(i + 6).padStart(2, '0') + ':00');
+  const WD = ['日', '一', '二', '三', '四', '五', '六'];
+  const CONCURRENCY = 4;   // 同時幾個請求。別調高，這是對人家伺服器的禮貌
+
+  /* ---------- 畫面骨架 ---------- */
+  const css = `
+  #cr-root{position:fixed;inset:0;z-index:2147483647;background:#08211E;
+    color:#E8EFEA;font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;
+    overflow-y:auto;-webkit-overflow-scrolling:touch}
+  #cr-root *{box-sizing:border-box}
+  .cr-wrap{padding:14px 12px 40px;max-width:900px;margin:0 auto}
+  .cr-top{display:flex;align-items:center;gap:10px;padding-bottom:10px;
+    border-bottom:1px solid rgba(232,239,234,.14)}
+  .cr-top h1{margin:0;font-size:17px;letter-spacing:.12em;font-weight:600}
+  .cr-time{font-size:11px;color:#6F918A;font-family:ui-monospace,monospace}
+  .cr-x{margin-left:auto;appearance:none;border:1px solid rgba(232,239,234,.2);
+    background:transparent;color:#E8EFEA;width:32px;height:32px;border-radius:16px;
+    font-size:17px;line-height:1;cursor:pointer;flex:none}
+  .cr-tabs{display:flex;gap:6px;margin:12px 0 4px;flex-wrap:wrap}
+  .cr-tab{appearance:none;border:1px solid rgba(232,239,234,.16);background:transparent;
+    color:#6F918A;padding:7px 15px;font:inherit;font-size:13px;border-radius:2px;
+    cursor:pointer;letter-spacing:.1em}
+  .cr-tab[data-on="1"]{color:#06201C;font-weight:600;border-color:transparent}
+  .cr-status{margin:14px 0;color:#6F918A;font-size:13px;line-height:1.7}
+  .cr-bar{height:3px;background:rgba(232,239,234,.1);border-radius:2px;margin-top:8px}
+  .cr-bar i{display:block;height:100%;width:0;background:#E6FA4B;border-radius:2px;
+    transition:width .2s}
+  .cr-panel{margin-top:16px}
+  .cr-panel h2{margin:0 0 2px;font-size:15px;font-weight:600;letter-spacing:.06em}
+  .cr-meta{margin:0 0 10px;color:#6F918A;font-size:12px}
+  .cr-row{display:grid;grid-template-columns:42px repeat(8,1fr);gap:2px;margin-bottom:2px}
+  .cr-h{text-align:center;line-height:1.1;padding-bottom:3px;
+    border-bottom:1px solid rgba(232,239,234,.14)}
+  .cr-h b{display:block;font-size:11px;font-weight:600}
+  .cr-h span{font-size:9px;color:#6F918A}
+  .cr-t{font-size:10px;color:#6F918A;display:flex;align-items:center;
+    font-family:ui-monospace,monospace}
+  .cr-c{appearance:none;border:0;border-radius:2px;height:22px;padding:0;
+    font-size:11px;font-weight:600;font-family:ui-monospace,monospace;cursor:pointer}
+  .cr-detail{position:sticky;bottom:0;background:rgba(8,33,30,.97);
+    border-top:1px solid rgba(232,239,234,.14);padding:11px 12px;font-size:13px;
+    margin:16px -12px -40px;min-height:44px;display:flex;align-items:center;
+    gap:10px;flex-wrap:wrap}
+  .cr-detail .cr-courts{color:#6F918A;font-size:11px}
+  .cr-err{color:#E6FA4B;font-size:13px;line-height:1.8}
+  `;
+  const root = document.createElement('div');
+  root.id = 'cr-root';
+  root.innerHTML = `<style>${css}</style><div class="cr-wrap">
+    <div class="cr-top">
+      <div><h1>場地雷達</h1><div class="cr-time" id="cr-time"></div></div>
+      <button class="cr-x" id="cr-close">✕</button>
+    </div>
+    <div id="cr-body"><div class="cr-status" id="cr-status">準備中…
+      <div class="cr-bar"><i id="cr-bar"></i></div></div></div>
+  </div>`;
+  document.body.appendChild(root);
+  document.getElementById('cr-close').onclick = () => root.remove();
+
+  const $ = (id) => document.getElementById(id);
+  const setStatus = (t) => { const e = $('cr-status'); if (e) e.firstChild.textContent = t; };
+  const setBar = (p) => { const e = $('cr-bar'); if (e) e.style.width = (p * 100) + '%'; };
+
+  /* ---------- 跟伺服器講話 ---------- */
+  async function post(path, data) {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: new URLSearchParams(data),
+    });
+    return r.text();
+  }
+
+  async function loggedIn() {
+    try {
+      const r = await fetch('/login/ajax/get_session.php', { method: 'POST' });
+      return (await r.json()).success === true;
+    } catch (e) { return false; }
+  }
+
+  async function getCourts(lid, sport) {
+    const html = await post('/Location/LocationSubList/ajax/createTable/', {
+      LID: lid,
+      CategoryID: sport.cat,
+      CategoryName: sport.name,
+      CategoryArrayStr: JSON.stringify(
+        [{ LID: lid, ItemID: sport.cat, Name: sport.name, ListOrder: '0' }]),
+      redirectFromIndex: 'false',
+      redirectFromSearch: 'false',
+    });
+    const ids = [...html.matchAll(/name=['"]LSID['"]\s*value=['"]([^'"]+)['"]/g)]
+      .map((m) => m[1]);
+    const nms = [...html.matchAll(/name=['"]LSIDName['"]\s*value=['"]([^'"]+)['"]/g)]
+      .map((m) => m[1]);
+    const seen = new Set(), out = [];
+    ids.forEach((id, i) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      out.push({ lsid: id, name: nms[i] || id });
+    });
+    return out;
+  }
+
+  async function getDay(lid, lsid, day) {
+    const raw = await post('/api/getRequestData.php', {
+      serviceName: 'getResLocationAvailableData',
+      LID: lid, LSID: lsid, QueryDate: day,
+    });
+    let j;
+    try { j = JSON.parse(raw.trim()); } catch (e) { return []; }
+    let rows = (((j.ResultData || {}).AvailableData || {}).DataTable || {}).DataRow || [];
+    if (!Array.isArray(rows)) rows = [rows];
+    // allowBooking=Y 且沒被標成已預約，才算真的空著
+    return rows.filter((r) => r.allowBooking === 'Y' && !r.Status)
+      .map((r) => String(r.Time || '').split(' ')[0]);
+  }
+
+  async function pool(jobs, n, fn, onTick) {
+    let i = 0, done = 0;
+    await Promise.all(Array.from({ length: n }, async () => {
+      while (i < jobs.length) {
+        const k = i++;
+        try { await fn(jobs[k]); } catch (e) { /* 單筆失敗就跳過 */ }
+        done++;
+        if (onTick) onTick(done / jobs.length);
+      }
+    }));
+  }
+
+  /* ---------- 開始抓 ---------- */
+  setStatus('確認登入狀態…');
+  if (!await loggedIn()) {
+    $('cr-body').innerHTML = `<p class="cr-err">看起來還沒登入。<br><br>
+      請先在這個網站登入（LINE 或其他方式都可以），登入完成後再點一次書籤。</p>`;
+    return;
+  }
+
+  const today = new Date();
+  const days = Array.from({ length: DAYS }, (_, i) => {
+    const d = new Date(today); d.setDate(d.getDate() + i);
+    return d.getFullYear() + '-' +
+      String(d.getMonth() + 1).padStart(2, '0') + '-' +
+      String(d.getDate()).padStart(2, '0');
+  });
+
+  setStatus('查場地清單…');
+  const data = {};
+  const jobs = [];
+  for (const v of VENUES) {
+    data[v.lid] = {};
+    for (const s of SPORTS) {
+      const courts = await getCourts(v.lid, s);
+      data[v.lid][s.name] = { total: courts.length, slots: {} };
+      days.forEach((d) => { data[v.lid][s.name].slots[d] = {}; });
+      for (const c of courts) {
+        for (const d of days) jobs.push({ v, s, c, d });
+      }
+    }
+  }
+
+  setStatus(`查詢中… 共 ${jobs.length} 筆`);
+  await pool(jobs, CONCURRENCY, async (job) => {
+    const free = await getDay(job.v.lid, job.c.lsid, job.d);
+    const bucket = data[job.v.lid][job.s.name].slots[job.d];
+    for (const t of free) {
+      if (!bucket[t]) bucket[t] = { free: 0, courts: [] };
+      bucket[t].free++;
+      bucket[t].courts.push(job.c.name);
+    }
+  }, setBar);
+
+  /* ---------- 畫熱力圖 ---------- */
+  const hex = (h) => [1, 3, 5].map((i) => parseInt(h.substr(i, 2), 16));
+  function mixc(a, b, t) {
+    const A = hex(a), B = hex(b);
+    return '#' + A.map((c, i) => {
+      const va = (c / 255) ** 2.2, vb = (B[i] / 255) ** 2.2;
+      const v = Math.round((((1 - t) * va + t * vb) ** (1 / 2.2)) * 255);
+      return v.toString(16).padStart(2, '0');
+    }).join('');
+  }
+
+  let curSport = SPORTS[0].name, curVenue = VENUES[0].lid;
+
+  function draw() {
+    const sport = SPORTS.find((s) => s.name === curSport);
+    const venue = VENUES.find((v) => v.lid === curVenue);
+    const block = data[venue.lid][sport.name];
+    const total = block.total;
+
+    let head = '<div class="cr-row"><div class="cr-t"></div>';
+    for (const d of days) {
+      const dt = new Date(d + 'T00:00:00');
+      head += `<div class="cr-h"><b>${dt.getMonth() + 1}/${dt.getDate()}</b>
+        <span>${WD[dt.getDay()]}</span></div>`;
+    }
+    head += '</div>';
+
+    let rows = '', sum = 0;
+    for (const t of SLOTS) {
+      rows += `<div class="cr-row"><div class="cr-t">${t}</div>`;
+      for (const d of days) {
+        const cell = block.slots[d][t];
+        const free = cell ? cell.free : 0;
+        sum += free;
+        const ratio = total ? free / total : 0;
+        const bg = mixc('#12332E', sport.accent, Math.pow(ratio, 0.75));
+        const fg = ratio > 0.42 ? '#06201C' : '#6F918A';
+        const glow = free ? `box-shadow:0 0 ${Math.round(ratio * 11)}px ${bg}` : '';
+        const payload = free
+          ? ` data-d="${d}" data-t="${t}" data-f="${free}" data-c="${(cell.courts || []).join(' · ')}"`
+          : '';
+        rows += `<button class="cr-c" style="background:${bg};color:${fg};${glow}"${payload}>${free || ''}</button>`;
+      }
+      rows += '</div>';
+    }
+
+    $('cr-body').innerHTML = `
+      <div class="cr-tabs">${SPORTS.map((s) =>
+        `<button class="cr-tab" data-sport="${s.name}" data-on="${s.name === curSport ? 1 : 0}"
+          style="${s.name === curSport ? 'background:' + s.accent : ''}">${s.name}</button>`).join('')}
+      </div>
+      <div class="cr-tabs">${VENUES.map((v) =>
+        `<button class="cr-tab" data-venue="${v.lid}" data-on="${v.lid === curVenue ? 1 : 0}"
+          style="${v.lid === curVenue ? 'background:#E8EFEA' : ''}">${v.short}</button>`).join('')}
+      </div>
+      <div class="cr-panel">
+        <h2>${venue.name}</h2>
+        <p class="cr-meta">${total} 面${sport.name}場 · 未來 ${DAYS} 天共 ${sum} 個空檔</p>
+        ${head}${rows}
+      </div>
+      <div class="cr-detail" id="cr-detail">點一格亮起來的時段看細節</div>`;
+
+    $('cr-body').querySelectorAll('[data-sport]').forEach((b) => {
+      b.onclick = () => { curSport = b.dataset.sport; draw(); };
+    });
+    $('cr-body').querySelectorAll('[data-venue]').forEach((b) => {
+      b.onclick = () => { curVenue = b.dataset.venue; draw(); };
+    });
+    $('cr-body').querySelectorAll('.cr-c[data-f]').forEach((b) => {
+      b.onclick = () => {
+        const end = String(Number(b.dataset.t.slice(0, 2)) + 1).padStart(2, '0') + ':00';
+        $('cr-detail').innerHTML =
+          `<b>${b.dataset.d} ${b.dataset.t}–${end}</b>
+           <span>剩 ${b.dataset.f} / ${total} 面</span>
+           <span class="cr-courts">${b.dataset.c}</span>`;
+      };
+    });
+  }
+
+  const now = new Date();
+  $('cr-time').textContent = '查詢於 ' +
+    String(now.getHours()).padStart(2, '0') + ':' +
+    String(now.getMinutes()).padStart(2, '0');
+  draw();
+})();
