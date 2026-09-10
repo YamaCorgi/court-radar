@@ -1,4 +1,4 @@
-/* 場地雷達 - 書籤版
+/* 場地雷達 - 書籤版 v2
  *
  * 這段程式跑在 teamweb.sporetrofit.com 這一頁裡面，用你自己的登入去查。
  * 沒有伺服器、沒有共用帳號、沒有排程，每次點都是當下最新的。
@@ -71,6 +71,7 @@
     gap:10px;flex-wrap:wrap}
   .cr-detail .cr-courts{color:#6F918A;font-size:11px}
   .cr-err{color:#E6FA4B;font-size:13px;line-height:1.8}
+  .cr-none{color:#6F918A;font-size:13px;line-height:1.8;margin-top:14px}
   `;
   const root = document.createElement('div');
   root.id = 'cr-root';
@@ -109,16 +110,31 @@
     } catch (e) { return false; }
   }
 
-  async function getCourts(lid, sport) {
-    const html = await post('/Location/LocationSubList/ajax/createTable/', {
-      LID: lid,
+  function baseForm(venue, sport) {
+    return {
+      LID: venue.lid,
+      LIDName: venue.name,
       CategoryID: sport.cat,
       CategoryName: sport.name,
-      CategoryArrayStr: JSON.stringify(
-        [{ LID: lid, ItemID: sport.cat, Name: sport.name, ListOrder: '0' }]),
+      CategoryArrayStr: JSON.stringify([{
+        LID: venue.lid, ItemID: sport.cat,
+        Name: sport.name, ListOrder: '0',
+      }]),
       redirectFromIndex: 'false',
       redirectFromSearch: 'false',
-    });
+      redirectFromFilter: '',
+    };
+  }
+
+  /* 關鍵：先讓伺服器把「目前選的場館與運動」切過去。
+     不做這步的話，查到的永遠是你點書籤時所在那一頁的場館。 */
+  async function setContext(venue, sport) {
+    await post('/Location/LocationSubList/', baseForm(venue, sport));
+  }
+
+  async function getCourts(venue, sport) {
+    const html = await post('/Location/LocationSubList/ajax/createTable/',
+      baseForm(venue, sport));
     const ids = [...html.matchAll(/name=['"]LSID['"]\s*value=['"]([^'"]+)['"]/g)]
       .map((m) => m[1]);
     const nms = [...html.matchAll(/name=['"]LSIDName['"]\s*value=['"]([^'"]+)['"]/g)]
@@ -174,31 +190,46 @@
       String(d.getDate()).padStart(2, '0');
   });
 
-  setStatus('查場地清單…');
   const data = {};
-  const jobs = [];
+  const groups = [];
   for (const v of VENUES) {
     data[v.lid] = {};
-    for (const s of SPORTS) {
-      const courts = await getCourts(v.lid, s);
-      data[v.lid][s.name] = { total: courts.length, slots: {} };
-      days.forEach((d) => { data[v.lid][s.name].slots[d] = {}; });
-      for (const c of courts) {
-        for (const d of days) jobs.push({ v, s, c, d });
-      }
-    }
+    for (const s of SPORTS) groups.push({ v, s });
   }
 
-  setStatus(`查詢中… 共 ${jobs.length} 筆`);
-  await pool(jobs, CONCURRENCY, async (job) => {
-    const free = await getDay(job.v.lid, job.c.lsid, job.d);
-    const bucket = data[job.v.lid][job.s.name].slots[job.d];
-    for (const t of free) {
-      if (!bucket[t]) bucket[t] = { free: 0, courts: [] };
-      bucket[t].free++;
-      bucket[t].courts.push(job.c.name);
+  // 一組一組做完再換下一組。session 狀態是全域的，混著併發會互相蓋掉。
+  let gi = 0;
+  for (const g of groups) {
+    const v = g.v, s = g.s;
+    gi++;
+    setStatus(`(${gi}/${groups.length}) ${v.short}・${s.name} — 查場地清單…`);
+    setBar((gi - 1) / groups.length);
+
+    await setContext(v, s);
+    let courts = await getCourts(v, s);
+    if (!courts.length) {
+      await setContext(v, s);          // 偶爾第一次切換沒生效，再試一次
+      courts = await getCourts(v, s);
     }
-  }, setBar);
+
+    data[v.lid][s.name] = { total: courts.length, slots: {} };
+    days.forEach((d) => { data[v.lid][s.name].slots[d] = {}; });
+    if (!courts.length) continue;
+
+    const jobs = [];
+    for (const c of courts) for (const d of days) jobs.push({ c, d });
+
+    setStatus(`(${gi}/${groups.length}) ${v.short}・${s.name} — ${courts.length} 面場地，查詢中…`);
+    await pool(jobs, CONCURRENCY, async (job) => {
+      const free = await getDay(v.lid, job.c.lsid, job.d);
+      const bucket = data[v.lid][s.name].slots[job.d];
+      for (const t of free) {
+        if (!bucket[t]) bucket[t] = { free: 0, courts: [] };
+        bucket[t].free++;
+        bucket[t].courts.push(job.c.name);
+      }
+    }, (p) => setBar((gi - 1 + p) / groups.length));
+  }
 
   /* ---------- 畫熱力圖 ---------- */
   const hex = (h) => [1, 3, 5].map((i) => parseInt(h.substr(i, 2), 16));
@@ -213,11 +244,41 @@
 
   let curSport = SPORTS[0].name, curVenue = VENUES[0].lid;
 
+  function tabsHtml() {
+    return `
+      <div class="cr-tabs">${SPORTS.map((s) =>
+        `<button class="cr-tab" data-sport="${s.name}" data-on="${s.name === curSport ? 1 : 0}"
+          style="${s.name === curSport ? 'background:' + s.accent : ''}">${s.name}</button>`).join('')}
+      </div>
+      <div class="cr-tabs">${VENUES.map((v) =>
+        `<button class="cr-tab" data-venue="${v.lid}" data-on="${v.lid === curVenue ? 1 : 0}"
+          style="${v.lid === curVenue ? 'background:#E8EFEA' : ''}">${v.short}</button>`).join('')}
+      </div>`;
+  }
+
+  function bindTabs() {
+    $('cr-body').querySelectorAll('[data-sport]').forEach((b) => {
+      b.onclick = () => { curSport = b.dataset.sport; draw(); };
+    });
+    $('cr-body').querySelectorAll('[data-venue]').forEach((b) => {
+      b.onclick = () => { curVenue = b.dataset.venue; draw(); };
+    });
+  }
+
   function draw() {
     const sport = SPORTS.find((s) => s.name === curSport);
     const venue = VENUES.find((v) => v.lid === curVenue);
-    const block = data[venue.lid][sport.name];
+    const block = data[venue.lid][sport.name] || { total: 0, slots: {} };
     const total = block.total;
+
+    if (!total) {
+      $('cr-body').innerHTML = tabsHtml() + `
+        <div class="cr-panel"><h2>${venue.name}</h2>
+        <p class="cr-none">查不到${sport.name}場地。<br>
+        可能是這個場館沒有這項運動，或伺服器暫時沒回應——關掉重點一次書籤試試。</p></div>`;
+      bindTabs();
+      return;
+    }
 
     let head = '<div class="cr-row"><div class="cr-t"></div>';
     for (const d of days) {
@@ -246,15 +307,7 @@
       rows += '</div>';
     }
 
-    $('cr-body').innerHTML = `
-      <div class="cr-tabs">${SPORTS.map((s) =>
-        `<button class="cr-tab" data-sport="${s.name}" data-on="${s.name === curSport ? 1 : 0}"
-          style="${s.name === curSport ? 'background:' + s.accent : ''}">${s.name}</button>`).join('')}
-      </div>
-      <div class="cr-tabs">${VENUES.map((v) =>
-        `<button class="cr-tab" data-venue="${v.lid}" data-on="${v.lid === curVenue ? 1 : 0}"
-          style="${v.lid === curVenue ? 'background:#E8EFEA' : ''}">${v.short}</button>`).join('')}
-      </div>
+    $('cr-body').innerHTML = tabsHtml() + `
       <div class="cr-panel">
         <h2>${venue.name}</h2>
         <p class="cr-meta">${total} 面${sport.name}場 · 未來 ${DAYS} 天共 ${sum} 個空檔</p>
@@ -262,12 +315,7 @@
       </div>
       <div class="cr-detail" id="cr-detail">點一格亮起來的時段看細節</div>`;
 
-    $('cr-body').querySelectorAll('[data-sport]').forEach((b) => {
-      b.onclick = () => { curSport = b.dataset.sport; draw(); };
-    });
-    $('cr-body').querySelectorAll('[data-venue]').forEach((b) => {
-      b.onclick = () => { curVenue = b.dataset.venue; draw(); };
-    });
+    bindTabs();
     $('cr-body').querySelectorAll('.cr-c[data-f]').forEach((b) => {
       b.onclick = () => {
         const end = String(Number(b.dataset.t.slice(0, 2)) + 1).padStart(2, '0') + ':00';
