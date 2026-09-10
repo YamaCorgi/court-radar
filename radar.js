@@ -1,4 +1,4 @@
-/* 場地雷達 - 書籤版 v5
+/* 場地雷達 - 書籤版 v6
  *
  * 這段程式跑在 teamweb.sporetrofit.com 這一頁裡面，用你自己的登入去查。
  * 沒有伺服器、沒有共用帳號、沒有排程，每次點都是當下最新的。
@@ -73,6 +73,8 @@
   .cr-err{color:#E6FA4B;font-size:13px;line-height:1.8}
   .cr-none{color:#6F918A;font-size:13px;line-height:1.8;margin-top:14px}
   .cr-warn{color:#E6FA4B}
+  .cr-diag{margin-top:16px;color:#6F918A;font-size:12px}
+  .cr-diag summary{cursor:pointer;padding:6px 0}
   .cr-h.cr-off b,.cr-h.cr-off span{color:#3E5B55}
   .cr-offcell{background:repeating-linear-gradient(45deg,#0C2622,#0C2622 3px,
     #102B27 3px,#102B27 6px);cursor:default}
@@ -175,13 +177,19 @@
     let rows = ((rd.AvailableData || {}).DataTable || {}).DataRow || [];
     if (!Array.isArray(rows)) rows = [rows];
     // allowBooking=Y 且沒被標成已預約，才算真的空著
-    const free = rows.filter((r) => r.allowBooking === 'Y' && !r.Status)
+    // 只看有沒有被預約。allowBooking 是「現在能不能按下去訂」的操作旗標，
+    // 對比較遠的日期可能是 N，但那個時段其實空著——拿它當「有沒有空」會漏掉一堆。
+    const free = rows.filter((r) => !r.Status)
       .map((r) => String(r.Time || '').split(' ')[0]);
     // 伺服器自己講的「開放預約區間」，用來區分「訂滿了」和「還沒開放」
     const window = (rd.ReservingStart && rd.ReservingEnd)
       ? [String(rd.ReservingStart).slice(0, 10), String(rd.ReservingEnd).slice(0, 10)]
       : null;
-    return { free: free, window: window };
+    return {
+      free: free, window: window,
+      rowCount: rows.length,
+      sample: JSON.stringify(rows.slice(0, 3)),
+    };
   }
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -284,6 +292,10 @@
       const res = await getDay(v.lid, job.c.lsid, job.d);
       if (res.window && !data[v.lid][s.name].window) {
         data[v.lid][s.name].window = res.window;
+      }
+      if (job.d === days[days.length - 1] && !data[v.lid][s.name].lastRaw) {
+        data[v.lid][s.name].lastRaw =
+          `${job.d} ${job.c.name}\n時段筆數 ${res.rowCount}\n\n${res.sample}`;
       }
       const bucket = data[v.lid][s.name].slots[job.d];
       for (const t of res.free) {
@@ -389,6 +401,9 @@
           ? ' <span class="cr-warn">（場地清單取自上次記錄）</span>' : ''}</p>
         ${head}${rows}
       </div>
+      <details class="cr-diag"><summary>診斷：最後一天的伺服器原始回應</summary>
+        <pre class="cr-dbg">${(block.lastRaw || '（沒有記錄）')
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;')}</pre></details>
       <div class="cr-detail" id="cr-detail">點一格亮起來的時段看細節</div>`;
 
     bindTabs();
