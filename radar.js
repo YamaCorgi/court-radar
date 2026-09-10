@@ -1,4 +1,4 @@
-/* 場地雷達 - 書籤版 v2
+/* 場地雷達 - 書籤版 v3
  *
  * 這段程式跑在 teamweb.sporetrofit.com 這一頁裡面，用你自己的登入去查。
  * 沒有伺服器、沒有共用帳號、沒有排程，每次點都是當下最新的。
@@ -72,6 +72,9 @@
   .cr-detail .cr-courts{color:#6F918A;font-size:11px}
   .cr-err{color:#E6FA4B;font-size:13px;line-height:1.8}
   .cr-none{color:#6F918A;font-size:13px;line-height:1.8;margin-top:14px}
+  .cr-dbg{background:#0E2E29;border:1px solid rgba(232,239,234,.14);border-radius:3px;
+    padding:10px;font-size:10px;line-height:1.6;color:#8FB0A8;white-space:pre-wrap;
+    word-break:break-all;max-height:300px;overflow:auto;font-family:ui-monospace,monospace}
   `;
   const root = document.createElement('div');
   root.id = 'cr-root';
@@ -129,12 +132,21 @@
   /* 關鍵：先讓伺服器把「目前選的場館與運動」切過去。
      不做這步的話，查到的永遠是你點書籤時所在那一頁的場館。 */
   async function setContext(venue, sport) {
+    // 真實操作是兩段：先選場館，再選運動。只做第二段的話伺服器狀態不會動。
+    await post('/Location/', {
+      LID: venue.lid,
+      LIDName: venue.name,
+      redirectFromIndex: 'false',
+      redirectFromSearch: 'false',
+    });
     await post('/Location/LocationSubList/', baseForm(venue, sport));
   }
 
+  let lastRaw = '';
   async function getCourts(venue, sport) {
     const html = await post('/Location/LocationSubList/ajax/createTable/',
       baseForm(venue, sport));
+    lastRaw = html;
     const ids = [...html.matchAll(/name=['"]LSID['"]\s*value=['"]([^'"]+)['"]/g)]
       .map((m) => m[1]);
     const nms = [...html.matchAll(/name=['"]LSIDName['"]\s*value=['"]([^'"]+)['"]/g)]
@@ -214,7 +226,14 @@
 
     data[v.lid][s.name] = { total: courts.length, slots: {} };
     days.forEach((d) => { data[v.lid][s.name].slots[d] = {}; });
-    if (!courts.length) continue;
+    if (!courts.length) {
+      // 查不到就把伺服器的原話留著，顯示在畫面上，不用再靠猜的
+      data[v.lid][s.name].debug =
+        `送出 CategoryID=${s.cat} / LID=${v.lid}\n` +
+        `伺服器回應長度 ${lastRaw.length}\n\n` +
+        lastRaw.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 500);
+      continue;
+    }
 
     const jobs = [];
     for (const c of courts) for (const d of days) jobs.push({ c, d });
@@ -274,8 +293,10 @@
     if (!total) {
       $('cr-body').innerHTML = tabsHtml() + `
         <div class="cr-panel"><h2>${venue.name}</h2>
-        <p class="cr-none">查不到${sport.name}場地。<br>
-        可能是這個場館沒有這項運動，或伺服器暫時沒回應——關掉重點一次書籤試試。</p></div>`;
+        <p class="cr-none">查不到${sport.name}場地。下面是伺服器實際回的內容，
+        截圖給我看就能知道原因：</p>
+        <pre class="cr-dbg">${(block.debug || '（沒有記錄）')
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;')}</pre></div>`;
       bindTabs();
       return;
     }
