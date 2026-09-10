@@ -1,4 +1,4 @@
-/* 場地雷達 - 書籤版 v3
+/* 場地雷達 - 書籤版 v4
  *
  * 這段程式跑在 teamweb.sporetrofit.com 這一頁裡面，用你自己的登入去查。
  * 沒有伺服器、沒有共用帳號、沒有排程，每次點都是當下最新的。
@@ -72,6 +72,9 @@
   .cr-detail .cr-courts{color:#6F918A;font-size:11px}
   .cr-err{color:#E6FA4B;font-size:13px;line-height:1.8}
   .cr-none{color:#6F918A;font-size:13px;line-height:1.8;margin-top:14px}
+  .cr-h.cr-off b,.cr-h.cr-off span{color:#3E5B55}
+  .cr-offcell{background:repeating-linear-gradient(45deg,#0C2622,#0C2622 3px,
+    #102B27 3px,#102B27 6px);cursor:default}
   .cr-dbg{background:#0E2E29;border:1px solid rgba(232,239,234,.14);border-radius:3px;
     padding:10px;font-size:10px;line-height:1.6;color:#8FB0A8;white-space:pre-wrap;
     word-break:break-all;max-height:300px;overflow:auto;font-family:ui-monospace,monospace}
@@ -166,12 +169,18 @@
       LID: lid, LSID: lsid, QueryDate: day,
     });
     let j;
-    try { j = JSON.parse(raw.trim()); } catch (e) { return []; }
-    let rows = (((j.ResultData || {}).AvailableData || {}).DataTable || {}).DataRow || [];
+    try { j = JSON.parse(raw.trim()); } catch (e) { return { free: [], window: null }; }
+    const rd = j.ResultData || {};
+    let rows = ((rd.AvailableData || {}).DataTable || {}).DataRow || [];
     if (!Array.isArray(rows)) rows = [rows];
     // allowBooking=Y 且沒被標成已預約，才算真的空著
-    return rows.filter((r) => r.allowBooking === 'Y' && !r.Status)
+    const free = rows.filter((r) => r.allowBooking === 'Y' && !r.Status)
       .map((r) => String(r.Time || '').split(' ')[0]);
+    // 伺服器自己講的「開放預約區間」，用來區分「訂滿了」和「還沒開放」
+    const window = (rd.ReservingStart && rd.ReservingEnd)
+      ? [String(rd.ReservingStart).slice(0, 10), String(rd.ReservingEnd).slice(0, 10)]
+      : null;
+    return { free: free, window: window };
   }
 
   async function pool(jobs, n, fn, onTick) {
@@ -240,9 +249,12 @@
 
     setStatus(`(${gi}/${groups.length}) ${v.short}・${s.name} — ${courts.length} 面場地，查詢中…`);
     await pool(jobs, CONCURRENCY, async (job) => {
-      const free = await getDay(v.lid, job.c.lsid, job.d);
+      const res = await getDay(v.lid, job.c.lsid, job.d);
+      if (res.window && !data[v.lid][s.name].window) {
+        data[v.lid][s.name].window = res.window;
+      }
       const bucket = data[v.lid][s.name].slots[job.d];
-      for (const t of free) {
+      for (const t of res.free) {
         if (!bucket[t]) bucket[t] = { free: 0, courts: [] };
         bucket[t].free++;
         bucket[t].courts.push(job.c.name);
@@ -301,11 +313,14 @@
       return;
     }
 
+    const win = block.window;
+    const outside = (d) => win && (d < win[0] || d > win[1]);
+
     let head = '<div class="cr-row"><div class="cr-t"></div>';
     for (const d of days) {
       const dt = new Date(d + 'T00:00:00');
-      head += `<div class="cr-h"><b>${dt.getMonth() + 1}/${dt.getDate()}</b>
-        <span>${WD[dt.getDay()]}</span></div>`;
+      head += `<div class="cr-h${outside(d) ? ' cr-off' : ''}"><b>${dt.getMonth() + 1}/${dt.getDate()}</b>
+        <span>${outside(d) ? '未開放' : WD[dt.getDay()]}</span></div>`;
     }
     head += '</div>';
 
@@ -313,6 +328,10 @@
     for (const t of SLOTS) {
       rows += `<div class="cr-row"><div class="cr-t">${t}</div>`;
       for (const d of days) {
+        if (outside(d)) {
+          rows += '<button class="cr-c cr-offcell" disabled></button>';
+          continue;
+        }
         const cell = block.slots[d][t];
         const free = cell ? cell.free : 0;
         sum += free;
@@ -331,7 +350,10 @@
     $('cr-body').innerHTML = tabsHtml() + `
       <div class="cr-panel">
         <h2>${venue.name}</h2>
-        <p class="cr-meta">${total} 面${sport.name}場 · 未來 ${DAYS} 天共 ${sum} 個空檔</p>
+        <p class="cr-meta">${total} 面${sport.name}場 · ${
+          win ? '開放預約 ' + win[0].slice(5).replace('-', '/') + ' 至 '
+                + win[1].slice(5).replace('-', '/') : '未來 ' + DAYS + ' 天'
+        } · 共 ${sum} 個空檔</p>
         ${head}${rows}
       </div>
       <div class="cr-detail" id="cr-detail">點一格亮起來的時段看細節</div>`;
