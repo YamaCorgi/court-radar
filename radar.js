@@ -1,4 +1,4 @@
-/* 場地雷達 - 書籤版 v4
+/* 場地雷達 - 書籤版 v5
  *
  * 這段程式跑在 teamweb.sporetrofit.com 這一頁裡面，用你自己的登入去查。
  * 沒有伺服器、沒有共用帳號、沒有排程，每次點都是當下最新的。
@@ -72,6 +72,7 @@
   .cr-detail .cr-courts{color:#6F918A;font-size:11px}
   .cr-err{color:#E6FA4B;font-size:13px;line-height:1.8}
   .cr-none{color:#6F918A;font-size:13px;line-height:1.8;margin-top:14px}
+  .cr-warn{color:#E6FA4B}
   .cr-h.cr-off b,.cr-h.cr-off span{color:#3E5B55}
   .cr-offcell{background:repeating-linear-gradient(45deg,#0C2622,#0C2622 3px,
     #102B27 3px,#102B27 6px);cursor:default}
@@ -183,6 +184,21 @@
     return { free: free, window: window };
   }
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /* 場地清單存在瀏覽器本機，純粹是場館名稱與代碼，沒有個人資料。 */
+  function cacheKey(venue, sport) {
+    return 'court-radar:courts:' + venue.lid + ':' + sport.cat;
+  }
+  function saveCourts(venue, sport, courts) {
+    try { localStorage.setItem(cacheKey(venue, sport), JSON.stringify(courts)); }
+    catch (e) { /* 無痕模式之類的存不了，不影響主流程 */ }
+  }
+  function loadCourts(venue, sport) {
+    try { return JSON.parse(localStorage.getItem(cacheKey(venue, sport)) || 'null'); }
+    catch (e) { return null; }
+  }
+
   async function pool(jobs, n, fn, onTick) {
     let i = 0, done = 0;
     await Promise.all(Array.from({ length: n }, async () => {
@@ -226,14 +242,30 @@
     setStatus(`(${gi}/${groups.length}) ${v.short}・${s.name} — 查場地清單…`);
     setBar((gi - 1) / groups.length);
 
-    await setContext(v, s);
-    let courts = await getCourts(v, s);
-    if (!courts.length) {
-      await setContext(v, s);          // 偶爾第一次切換沒生效，再試一次
+    // 這個端點時好時壞，原因未明，所以多試幾次，每次之間停一下
+    let courts = [];
+    for (let attempt = 1; attempt <= 3 && !courts.length; attempt++) {
+      if (attempt > 1) {
+        setStatus(`(${gi}/${groups.length}) ${v.short}・${s.name} — 重試 ${attempt}/3…`);
+        await sleep(600);
+      }
+      await setContext(v, s);
+      await sleep(250);               // 給伺服器一點時間把狀態寫進 session
       courts = await getCourts(v, s);
     }
 
-    data[v.lid][s.name] = { total: courts.length, slots: {} };
+    let fromCache = false;
+    if (courts.length) {
+      saveCourts(v, s, courts);       // 成功就記起來
+    } else {
+      const cached = loadCourts(v, s);
+      if (cached && cached.length) {  // 抓不到就用上次記住的，場地代碼幾乎不會變
+        courts = cached;
+        fromCache = true;
+      }
+    }
+
+    data[v.lid][s.name] = { total: courts.length, slots: {}, fromCache: fromCache };
     days.forEach((d) => { data[v.lid][s.name].slots[d] = {}; });
     if (!courts.length) {
       // 查不到就把伺服器的原話留著，顯示在畫面上，不用再靠猜的
@@ -353,7 +385,8 @@
         <p class="cr-meta">${total} 面${sport.name}場 · ${
           win ? '開放預約 ' + win[0].slice(5).replace('-', '/') + ' 至 '
                 + win[1].slice(5).replace('-', '/') : '未來 ' + DAYS + ' 天'
-        } · 共 ${sum} 個空檔</p>
+        } · 共 ${sum} 個空檔${block.fromCache
+          ? ' <span class="cr-warn">（場地清單取自上次記錄）</span>' : ''}</p>
         ${head}${rows}
       </div>
       <div class="cr-detail" id="cr-detail">點一格亮起來的時段看細節</div>`;
