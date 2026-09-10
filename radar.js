@@ -1,4 +1,4 @@
-/* 場地雷達 - 書籤版 v7
+/* 場地雷達 - 書籤版 v8
  *
  * 這段程式跑在 teamweb.sporetrofit.com 這一頁裡面，用你自己的登入去查。
  * 沒有伺服器、沒有共用帳號、沒有排程，每次點都是當下最新的。
@@ -31,6 +31,7 @@
   // 這個伺服器的查詢狀態存在 session 裡，同時發多個請求會互相覆蓋，
   // 導致回來的全是同一天的資料。只能一次問一個。
   const CONCURRENCY = 1;
+  const REQUEST_GAP = 180;   // 每筆之間的間隔（毫秒）。發太快會被伺服器擋掉。
 
   /* ---------- 畫面骨架 ---------- */
   const css = `
@@ -151,6 +152,15 @@
   }
 
   let lastRaw = '';
+  /* 進到「某一面場地」的頁面。真實操作一定會經過這步，
+     少了它，伺服器只肯回前一兩天，之後就整個不受理。 */
+  async function setCourt(venue, sport, court) {
+    const f = baseForm(venue, sport);
+    f.LSID = court.lsid;
+    f.LSIDName = court.name;
+    await post('/Location/LocationSubList/LocationSub/', f);
+  }
+
   async function getCourts(venue, sport) {
     const html = await post('/Location/LocationSubList/ajax/createTable/',
       baseForm(venue, sport));
@@ -174,7 +184,8 @@
       LID: lid, LSID: lsid, QueryDate: day,
     });
     let j;
-    try { j = JSON.parse(raw.trim()); } catch (e) { return { free: [], window: null }; }
+    try { j = JSON.parse(raw.trim()); }
+    catch (e) { return { free: [], window: null, rowCount: 0, raw: raw.slice(0, 200) }; }
     const rd = j.ResultData || {};
     let rows = ((rd.AvailableData || {}).DataTable || {}).DataRow || [];
     if (!Array.isArray(rows)) rows = [rows];
@@ -187,12 +198,16 @@
     const window = (rd.ReservingStart && rd.ReservingEnd)
       ? [String(rd.ReservingStart).slice(0, 10), String(rd.ReservingEnd).slice(0, 10)]
       : null;
-    // 伺服器有沒有回應我們問的日期？把它自己講的日期抓出來比對
-    const echoed = rd.QueryDate || rd.Date || rd.ReserveDate || '';
+    // 成功的回應一定會把 QueryDate 帶回來。沒帶回來 = 這筆被伺服器擋掉了，
+    // 不是「那天沒空位」——真的沒空位時它照樣會回日期和一整排標示已預約的時段。
+    const echoed = String(rd.QueryDate || rd.Date || rd.ReserveDate || '').slice(0, 10);
     return {
+      ok: !!echoed,
       free: free, window: window,
       rowCount: rows.length,
-      echoed: String(echoed).slice(0, 10),
+      echoed: echoed,
+      msg: String(rd.ResultMsg || j.ResultMsg || j.Result || '').slice(0, 120),
+      raw: raw.slice(0, 200),
       keys: Object.keys(rd).join(','),
       firstTime: rows.length ? String(rows[0].Time || '') : '',
       sample: JSON.stringify(rows.slice(0, 2)),
@@ -291,35 +306,58 @@
       continue;
     }
 
-    const jobs = [];
-    for (const c of courts) for (const d of days) jobs.push({ c, d });
+    const blk = data[v.lid][s.name];
+    blk.probe = [];
+    let done = 0;
+    const totalJobs = courts.length * days.length;
 
-    setStatus(`(${gi}/${groups.length}) ${v.short}・${s.name} — ${courts.length} 面場地，查詢中…`);
-    await pool(jobs, CONCURRENCY, async (job) => {
-      const res = await getDay(v.lid, job.c.lsid, job.d);
-      if (res.window && !data[v.lid][s.name].window) {
-        data[v.lid][s.name].window = res.window;
-      }
-      const blk = data[v.lid][s.name];
-      if (!blk.probe) blk.probe = [];
-      if (blk.probe.length < 6) {
-        blk.probe.push(
-          `問 ${job.d} ${job.c.name}` +
-          ` → 回 ${res.echoed || '(沒回日期)'}` +
-          ` 筆數 ${res.rowCount}` +
-          ` 首筆 ${res.firstTime || '(無)'}`);
-        if (blk.probe.length === 1) {
-          blk.probe.push('ResultData 欄位: ' + res.keys);
-          blk.probe.push('原始樣本: ' + res.sample);
+    for (const c of courts) {
+      await setCourt(v, s, c);        // 先進到這面場地的頁面
+      await sleep(200);
+
+      for (const d of days) {
+        // 請求太密集會被伺服器擋掉（回空殼、不帶 QueryDate），所以每筆之間留間隔，
+        // 被擋到就等久一點再試，每次等更久。
+        let res = null, tries = 0;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          if (attempt > 0) {
+            setStatus(`(${gi}/${groups.length}) ${v.short}・${s.name} — `
+              + `${c.name} ${d.slice(5)} 被擋下，等一下重試 ${attempt}/3`);
+            await sleep(600 * attempt);
+            await setCourt(v, s, c);     // 順便把場地頁面重進一次
+            await sleep(300);
+          }
+          res = await getDay(v.lid, c.lsid, d);
+          tries = attempt + 1;
+          if (res.ok) break;
         }
+        res.retried = tries > 1;
+        if (!res.ok) blk.failed = (blk.failed || 0) + 1;
+        await sleep(REQUEST_GAP);
+
+        if (res.window && !blk.window) blk.window = res.window;
+
+        if (blk.probe.length < 10) {
+          blk.probe.push(
+            `問 ${d} ${c.name}` +
+            ` → 回 ${res.echoed || '(沒回日期)'}` +
+            ` 筆數 ${res.rowCount}` +
+            (res.retried ? ' [重試過]' : '') +
+            (!res.rowCount ? `\n    伺服器說: ${res.msg || '(沒訊息)'}` +
+              `\n    原始: ${(res.raw || '').slice(0, 120)}` : ''));
+        }
+
+        const bucket = blk.slots[d];
+        for (const t of res.free) {
+          if (!bucket[t]) bucket[t] = { free: 0, courts: [] };
+          bucket[t].free++;
+          bucket[t].courts.push(c.name);
+        }
+        done++;
+        setBar((gi - 1 + done / totalJobs) / groups.length);
+        setStatus(`(${gi}/${groups.length}) ${v.short}・${s.name} — ${c.name} ${done}/${totalJobs}`);
       }
-      const bucket = data[v.lid][s.name].slots[job.d];
-      for (const t of res.free) {
-        if (!bucket[t]) bucket[t] = { free: 0, courts: [] };
-        bucket[t].free++;
-        bucket[t].courts.push(job.c.name);
-      }
-    }, (p) => setBar((gi - 1 + p) / groups.length));
+    }
   }
 
   /* ---------- 畫熱力圖 ---------- */
@@ -414,7 +452,8 @@
           win ? '開放預約 ' + win[0].slice(5).replace('-', '/') + ' 至 '
                 + win[1].slice(5).replace('-', '/') : '未來 ' + DAYS + ' 天'
         } · 共 ${sum} 個空檔${block.fromCache
-          ? ' <span class="cr-warn">（場地清單取自上次記錄）</span>' : ''}</p>
+          ? ' <span class="cr-warn">（場地清單取自上次記錄）</span>' : ''}${block.failed
+          ? ` <span class="cr-warn">· ${block.failed} 筆被擋下，這張圖可能少算</span>` : ''}</p>
         ${head}${rows}
       </div>
       <details class="cr-diag"><summary>診斷：問的日期 vs 伺服器回的日期</summary>
