@@ -1,4 +1,4 @@
-/* 場地雷達 - 書籤版 v6
+/* 場地雷達 - 書籤版 v7
  *
  * 這段程式跑在 teamweb.sporetrofit.com 這一頁裡面，用你自己的登入去查。
  * 沒有伺服器、沒有共用帳號、沒有排程，每次點都是當下最新的。
@@ -28,7 +28,9 @@
   const SLOTS = Array.from({ length: 16 }, (_, i) =>
     String(i + 6).padStart(2, '0') + ':00');
   const WD = ['日', '一', '二', '三', '四', '五', '六'];
-  const CONCURRENCY = 4;   // 同時幾個請求。別調高，這是對人家伺服器的禮貌
+  // 這個伺服器的查詢狀態存在 session 裡，同時發多個請求會互相覆蓋，
+  // 導致回來的全是同一天的資料。只能一次問一個。
+  const CONCURRENCY = 1;
 
   /* ---------- 畫面骨架 ---------- */
   const css = `
@@ -185,10 +187,15 @@
     const window = (rd.ReservingStart && rd.ReservingEnd)
       ? [String(rd.ReservingStart).slice(0, 10), String(rd.ReservingEnd).slice(0, 10)]
       : null;
+    // 伺服器有沒有回應我們問的日期？把它自己講的日期抓出來比對
+    const echoed = rd.QueryDate || rd.Date || rd.ReserveDate || '';
     return {
       free: free, window: window,
       rowCount: rows.length,
-      sample: JSON.stringify(rows.slice(0, 3)),
+      echoed: String(echoed).slice(0, 10),
+      keys: Object.keys(rd).join(','),
+      firstTime: rows.length ? String(rows[0].Time || '') : '',
+      sample: JSON.stringify(rows.slice(0, 2)),
     };
   }
 
@@ -293,9 +300,18 @@
       if (res.window && !data[v.lid][s.name].window) {
         data[v.lid][s.name].window = res.window;
       }
-      if (job.d === days[days.length - 1] && !data[v.lid][s.name].lastRaw) {
-        data[v.lid][s.name].lastRaw =
-          `${job.d} ${job.c.name}\n時段筆數 ${res.rowCount}\n\n${res.sample}`;
+      const blk = data[v.lid][s.name];
+      if (!blk.probe) blk.probe = [];
+      if (blk.probe.length < 6) {
+        blk.probe.push(
+          `問 ${job.d} ${job.c.name}` +
+          ` → 回 ${res.echoed || '(沒回日期)'}` +
+          ` 筆數 ${res.rowCount}` +
+          ` 首筆 ${res.firstTime || '(無)'}`);
+        if (blk.probe.length === 1) {
+          blk.probe.push('ResultData 欄位: ' + res.keys);
+          blk.probe.push('原始樣本: ' + res.sample);
+        }
       }
       const bucket = data[v.lid][s.name].slots[job.d];
       for (const t of res.free) {
@@ -401,8 +417,8 @@
           ? ' <span class="cr-warn">（場地清單取自上次記錄）</span>' : ''}</p>
         ${head}${rows}
       </div>
-      <details class="cr-diag"><summary>診斷：最後一天的伺服器原始回應</summary>
-        <pre class="cr-dbg">${(block.lastRaw || '（沒有記錄）')
+      <details class="cr-diag"><summary>診斷：問的日期 vs 伺服器回的日期</summary>
+        <pre class="cr-dbg">${((block.probe || ['（沒有記錄）']).join('\n'))
           .replace(/&/g, '&amp;').replace(/</g, '&lt;')}</pre></details>
       <div class="cr-detail" id="cr-detail">點一格亮起來的時段看細節</div>`;
 
